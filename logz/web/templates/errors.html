@@ -1,0 +1,707 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>错误日志 - 日志管理系统</title>
+    <link
+      href="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/css/bootstrap.min.css"
+      rel="stylesheet"
+    />
+    <link
+      href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.7.2/font/bootstrap-icons.css"
+      rel="stylesheet"
+    />
+    <style>
+      .error-card {
+        border-left: 4px solid #dc3545;
+        transition: all 0.3s ease;
+      }
+      .error-card:hover {
+        transform: translateY(-2px);
+        box-shadow: 0 4px 12px rgba(220, 53, 69, 0.2);
+      }
+      .error-header {
+        background: linear-gradient(135deg, #dc3545 0%, #c82333 100%);
+        color: white;
+      }
+      .error-stats {
+        background: linear-gradient(135deg, #fd7e14 0%, #e55a00 100%);
+        color: white;
+      }
+      .trace-id {
+        font-family: "Courier New", monospace;
+        background-color: #f8f9fa;
+        padding: 2px 6px;
+        border-radius: 3px;
+        font-size: 0.9em;
+      }
+      .error-message {
+        font-weight: 500;
+        color: #dc3545;
+      }
+      .error-time {
+        font-size: 0.9em;
+        color: #6c757d;
+      }
+      .error-service {
+        background-color: #e9ecef;
+        padding: 2px 8px;
+        border-radius: 12px;
+        font-size: 0.8em;
+        color: #495057;
+      }
+      .filters-panel {
+        background: linear-gradient(135deg, #6f42c1 0%, #5a32a3 100%);
+        color: white;
+      }
+      .error-details {
+        max-height: 200px;
+        overflow-y: auto;
+        background-color: #f8f9fa;
+        border: 1px solid #dee2e6;
+        border-radius: 0.375rem;
+        padding: 10px;
+        font-family: "Courier New", monospace;
+        font-size: 0.85em;
+      }
+    </style>
+  </head>
+  <body>
+    <nav class="navbar navbar-expand-lg navbar-dark bg-dark">
+      <div class="container">
+        <a class="navbar-brand" href="/">
+          <i class="bi bi-journal-text"></i> 日志管理系统
+        </a>
+        <div class="navbar-nav ms-auto">
+          <a class="nav-link" href="/"><i class="bi bi-house"></i> 首页</a>
+          <a class="nav-link active" href="/errors"
+            ><i class="bi bi-exclamation-triangle"></i> 错误日志</a
+          >
+        </div>
+      </div>
+    </nav>
+
+    <div class="container mt-4">
+      <!-- 错误统计 -->
+      <div class="row mb-4">
+        <div class="col-md-3">
+          <div class="card error-stats">
+            <div class="card-body text-center">
+              <h5 class="card-title">今日错误</h5>
+              <h3 id="todayErrors">-</h3>
+            </div>
+          </div>
+        </div>
+        <div class="col-md-3">
+          <div class="card error-stats">
+            <div class="card-body text-center">
+              <h5 class="card-title">本周错误</h5>
+              <h3 id="weekErrors">-</h3>
+            </div>
+          </div>
+        </div>
+        <div class="col-md-3">
+          <div class="card error-stats">
+            <div class="card-body text-center">
+              <h5 class="card-title">错误服务数</h5>
+              <h3 id="errorServices">-</h3>
+            </div>
+          </div>
+        </div>
+        <div class="col-md-3">
+          <div class="card error-stats">
+            <div class="card-body text-center">
+              <h5 class="card-title">最新错误</h5>
+              <h6 id="latestError">-</h6>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 过滤面板 -->
+      <div class="card filters-panel mb-4">
+        <div class="card-body">
+          <h5 class="card-title"><i class="bi bi-funnel"></i> 错误过滤</h5>
+          <div class="row">
+            <div class="col-md-3">
+              <label for="serviceFilter" class="form-label text-white"
+                >服务过滤:</label
+              >
+              <select
+                class="form-select"
+                id="serviceFilter"
+                onchange="filterErrors()"
+              >
+                <option value="">所有服务</option>
+              </select>
+            </div>
+            <div class="col-md-3">
+              <label for="timeFilter" class="form-label text-white"
+                >时间范围:</label
+              >
+              <select
+                class="form-select"
+                id="timeFilter"
+                onchange="filterErrors()"
+              >
+                <option value="1h">最近1小时</option>
+                <option value="6h">最近6小时</option>
+                <option value="24h" selected>最近24小时</option>
+                <option value="7d">最近7天</option>
+                <option value="30d">最近30天</option>
+              </select>
+            </div>
+            <div class="col-md-3">
+              <label for="messageFilter" class="form-label text-white"
+                >消息过滤:</label
+              >
+              <input
+                type="text"
+                class="form-control"
+                id="messageFilter"
+                placeholder="输入关键词..."
+                onkeyup="filterErrors()"
+              />
+            </div>
+            <div class="col-md-3">
+              <label class="form-label text-white">&nbsp;</label>
+              <div>
+                <button class="btn btn-light btn-sm" onclick="refreshErrors()">
+                  <i class="bi bi-arrow-clockwise"></i> 刷新
+                </button>
+                <button class="btn btn-light btn-sm" onclick="exportErrors()">
+                  <i class="bi bi-download"></i> 导出
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 错误列表 -->
+      <div class="card">
+        <div class="card-header error-header">
+          <div class="d-flex justify-content-between align-items-center">
+            <h5 class="mb-0">
+              <i class="bi bi-exclamation-triangle"></i> 错误日志列表
+            </h5>
+            <div class="text-white">
+              显示 <span id="errorCount">0</span> 条错误
+            </div>
+          </div>
+        </div>
+        <div class="card-body">
+          <div id="errorList">
+            <!-- 错误列表将通过JavaScript动态加载 -->
+          </div>
+
+          <!-- 分页 -->
+          <div class="d-flex justify-content-between align-items-center mt-4">
+            <div class="pagination-info">
+              第 <span id="currentPage">1</span> 页，共
+              <span id="totalPages">1</span> 页
+            </div>
+            <div class="btn-group" role="group">
+              <button
+                class="btn btn-outline-primary btn-sm"
+                onclick="firstPage()"
+              >
+                <i class="bi bi-chevron-double-left"></i>
+              </button>
+              <button
+                class="btn btn-outline-primary btn-sm"
+                onclick="prevPage()"
+              >
+                <i class="bi bi-chevron-left"></i>
+              </button>
+              <button
+                class="btn btn-outline-primary btn-sm"
+                onclick="nextPage()"
+              >
+                <i class="bi bi-chevron-right"></i>
+              </button>
+              <button
+                class="btn btn-outline-primary btn-sm"
+                onclick="lastPage()"
+              >
+                <i class="bi bi-chevron-double-right"></i>
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 错误详情模态框 -->
+    <div class="modal fade" id="errorDetailModal" tabindex="-1">
+      <div class="modal-dialog modal-lg">
+        <div class="modal-content">
+          <div class="modal-header bg-danger text-white">
+            <h5 class="modal-title">
+              <i class="bi bi-exclamation-triangle"></i> 错误详情
+            </h5>
+            <button
+              type="button"
+              class="btn-close btn-close-white"
+              data-bs-dismiss="modal"
+            ></button>
+          </div>
+          <div class="modal-body">
+            <div id="errorDetailContent">
+              <!-- 错误详情将通过JavaScript动态加载 -->
+            </div>
+          </div>
+          <div class="modal-footer">
+            <button
+              type="button"
+              class="btn btn-secondary"
+              data-bs-dismiss="modal"
+            >
+              关闭
+            </button>
+            <button
+              type="button"
+              class="btn btn-primary"
+              onclick="copyErrorDetail()"
+            >
+              <i class="bi bi-clipboard"></i> 复制
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/js/bootstrap.bundle.min.js"></script>
+    <script>
+      let currentPage = 1;
+      let pageSize = 20;
+      let totalErrors = 0;
+      let allErrors = [];
+      let filteredErrors = [];
+
+      // 页面加载时初始化
+      document.addEventListener("DOMContentLoaded", function () {
+        loadErrorStats();
+        loadErrors();
+      });
+
+      // 加载错误统计
+      async function loadErrorStats() {
+        try {
+          // 获取今日错误
+          const todayStart = new Date();
+          todayStart.setHours(0, 0, 0, 0);
+          const todayEnd = new Date();
+
+          const todayResponse = await fetch(
+            "/api/errors?" +
+              new URLSearchParams({
+                start_time: todayStart.toISOString(),
+                end_time: todayEnd.toISOString(),
+                limit: 1,
+              })
+          );
+
+          if (todayResponse.ok) {
+            const todayResult = await todayResponse.json();
+            if (todayResult.success) {
+              document.getElementById("todayErrors").textContent =
+                todayResult.data.total || 0;
+            }
+          }
+
+          // 获取本周错误
+          const weekStart = new Date();
+          weekStart.setDate(weekStart.getDate() - weekStart.getDay());
+          weekStart.setHours(0, 0, 0, 0);
+
+          const weekResponse = await fetch(
+            "/api/errors?" +
+              new URLSearchParams({
+                start_time: weekStart.toISOString(),
+                end_time: todayEnd.toISOString(),
+                limit: 1,
+              })
+          );
+
+          if (weekResponse.ok) {
+            const weekResult = await weekResponse.json();
+            if (weekResult.success) {
+              document.getElementById("weekErrors").textContent =
+                weekResult.data.total || 0;
+            }
+          }
+        } catch (error) {
+          console.error("加载错误统计失败:", error);
+        }
+      }
+
+      // 加载错误日志
+      async function loadErrors() {
+        try {
+          const timeFilter = document.getElementById("timeFilter").value;
+          const startTime = getStartTime(timeFilter);
+
+          const response = await fetch(
+            "/api/errors?" +
+              new URLSearchParams({
+                limit: 1000, // 获取更多数据用于客户端过滤
+                offset: 0,
+                start_time: startTime.toISOString(),
+              })
+          );
+
+          const result = await response.json();
+
+          if (result.success) {
+            allErrors = result.data.entries || [];
+            updateServiceFilter();
+            filterErrors();
+          } else {
+            showAlert("加载错误日志失败: " + result.error, "danger");
+          }
+        } catch (error) {
+          console.error("加载错误日志失败:", error);
+          showAlert("加载错误日志失败: " + error.message, "danger");
+        }
+      }
+
+      // 获取开始时间
+      function getStartTime(timeFilter) {
+        const now = new Date();
+        switch (timeFilter) {
+          case "1h":
+            return new Date(now.getTime() - 60 * 60 * 1000);
+          case "6h":
+            return new Date(now.getTime() - 6 * 60 * 60 * 1000);
+          case "24h":
+            return new Date(now.getTime() - 24 * 60 * 60 * 1000);
+          case "7d":
+            return new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+          case "30d":
+            return new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
+          default:
+            return new Date(now.getTime() - 24 * 60 * 60 * 1000);
+        }
+      }
+
+      // 更新服务过滤器
+      function updateServiceFilter() {
+        const services = [
+          ...new Set(allErrors.map((error) => error.service).filter(Boolean)),
+        ];
+        const serviceFilter = document.getElementById("serviceFilter");
+
+        // 保留"所有服务"选项
+        serviceFilter.innerHTML = '<option value="">所有服务</option>';
+
+        services.forEach((service) => {
+          const option = document.createElement("option");
+          option.value = service;
+          option.textContent = service;
+          serviceFilter.appendChild(option);
+        });
+      }
+
+      // 过滤错误
+      function filterErrors() {
+        const serviceFilter = document.getElementById("serviceFilter").value;
+        const messageFilter = document
+          .getElementById("messageFilter")
+          .value.toLowerCase();
+
+        filteredErrors = allErrors.filter((error) => {
+          // 服务过滤
+          if (serviceFilter && error.service !== serviceFilter) {
+            return false;
+          }
+
+          // 消息过滤
+          if (
+            messageFilter &&
+            !error.msg.toLowerCase().includes(messageFilter)
+          ) {
+            return false;
+          }
+
+          return true;
+        });
+
+        currentPage = 1;
+        displayErrors();
+      }
+
+      // 显示错误列表
+      function displayErrors() {
+        const errorList = document.getElementById("errorList");
+        const startIndex = (currentPage - 1) * pageSize;
+        const endIndex = startIndex + pageSize;
+        const pageErrors = filteredErrors.slice(startIndex, endIndex);
+
+        document.getElementById("errorCount").textContent =
+          filteredErrors.length;
+        document.getElementById("currentPage").textContent = currentPage;
+        document.getElementById("totalPages").textContent = Math.ceil(
+          filteredErrors.length / pageSize
+        );
+
+        if (pageErrors.length === 0) {
+          errorList.innerHTML =
+            '<div class="text-center text-muted py-4"><p>暂无错误日志</p></div>';
+          return;
+        }
+
+        errorList.innerHTML = pageErrors
+          .map(
+            (error) => `
+                <div class="card error-card mb-3">
+                    <div class="card-body">
+                        <div class="row">
+                            <div class="col-md-8">
+                                <div class="d-flex justify-content-between align-items-start mb-2">
+                                    <h6 class="error-message mb-0">${escapeHtml(
+                                      error.msg
+                                    )}</h6>
+                                    <span class="error-service">${
+                                      error.service || "未知服务"
+                                    }</span>
+                                </div>
+                                <div class="mb-2">
+                                    ${
+                                      error.trace_id
+                                        ? `<span class="trace-id">Trace: ${error.trace_id}</span>`
+                                        : ""
+                                    }
+                                    ${
+                                      error.span_id
+                                        ? `<span class="trace-id ms-2">Span: ${error.span_id}</span>`
+                                        : ""
+                                    }
+                                </div>
+                                <div class="error-time">
+                                    <i class="bi bi-clock"></i> ${formatDate(
+                                      error.timestamp
+                                    )}
+                                </div>
+                            </div>
+                            <div class="col-md-4 text-end">
+                                <button class="btn btn-outline-danger btn-sm" onclick="showErrorDetail('${escapeHtml(
+                                  JSON.stringify(error)
+                                )}')">
+                                    <i class="bi bi-eye"></i> 详情
+                                </button>
+                                <button class="btn btn-outline-primary btn-sm" onclick="viewInFile('${
+                                  error.file_id || ""
+                                }')">
+                                    <i class="bi bi-file-text"></i> 查看文件
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            `
+          )
+          .join("");
+      }
+
+      // 显示错误详情
+      function showErrorDetail(errorJson) {
+        try {
+          const error = JSON.parse(errorJson);
+          const detailContent = document.getElementById("errorDetailContent");
+
+          detailContent.innerHTML = `
+                    <div class="row">
+                        <div class="col-md-6">
+                            <h6>基本信息</h6>
+                            <table class="table table-sm">
+                                <tr><td>时间:</td><td>${formatDate(
+                                  error.timestamp
+                                )}</td></tr>
+                                <tr><td>级别:</td><td><span class="badge bg-danger">${
+                                  error.level
+                                }</span></td></tr>
+                                <tr><td>服务:</td><td>${
+                                  error.service || "-"
+                                }</td></tr>
+                                <tr><td>Trace ID:</td><td><code>${
+                                  error.trace_id || "-"
+                                }</code></td></tr>
+                                <tr><td>Span ID:</td><td><code>${
+                                  error.span_id || "-"
+                                }</code></td></tr>
+                                <tr><td>调用者:</td><td>${
+                                  error.caller || "-"
+                                }</td></tr>
+                            </table>
+                        </div>
+                        <div class="col-md-6">
+                            <h6>消息</h6>
+                            <div class="alert alert-danger">${escapeHtml(
+                              error.msg
+                            )}</div>
+                        </div>
+                    </div>
+                    ${
+                      error.fields && Object.keys(error.fields).length > 0
+                        ? `
+                        <div class="mt-3">
+                            <h6>附加字段</h6>
+                            <div class="error-details">${escapeHtml(
+                              JSON.stringify(error.fields, null, 2)
+                            )}</div>
+                        </div>
+                    `
+                        : ""
+                    }
+                `;
+
+          new bootstrap.Modal(
+            document.getElementById("errorDetailModal")
+          ).show();
+        } catch (error) {
+          showAlert("显示错误详情失败: " + error.message, "danger");
+        }
+      }
+
+      // 在文件中查看
+      function viewInFile(fileId) {
+        if (fileId) {
+          window.open(`/view/${fileId}.log`, "_blank");
+        } else {
+          showAlert("无法确定文件位置", "warning");
+        }
+      }
+
+      // 复制错误详情
+      function copyErrorDetail() {
+        const detailContent = document.getElementById("errorDetailContent");
+        const text = detailContent.innerText;
+
+        navigator.clipboard
+          .writeText(text)
+          .then(() => {
+            showAlert("错误详情已复制到剪贴板", "success");
+          })
+          .catch(() => {
+            showAlert("复制失败", "danger");
+          });
+      }
+
+      // 刷新错误日志
+      function refreshErrors() {
+        loadErrorStats();
+        loadErrors();
+      }
+
+      // 导出错误日志
+      function exportErrors() {
+        const csvContent = generateErrorCSV(filteredErrors);
+        const blob = new Blob([csvContent], {
+          type: "text/csv;charset=utf-8;",
+        });
+        const link = document.createElement("a");
+        link.href = URL.createObjectURL(blob);
+        link.download = `errors_${new Date().toISOString().split("T")[0]}.csv`;
+        link.click();
+      }
+
+      // 生成CSV内容
+      function generateErrorCSV(errors) {
+        const headers = [
+          "时间",
+          "级别",
+          "服务",
+          "Trace ID",
+          "Span ID",
+          "消息",
+          "调用者",
+        ];
+        const rows = errors.map((error) => [
+          error.timestamp,
+          error.level,
+          error.service || "",
+          error.trace_id || "",
+          error.span_id || "",
+          error.msg,
+          error.caller || "",
+        ]);
+
+        return [headers, ...rows]
+          .map((row) =>
+            row.map((field) => `"${field.replace(/"/g, '""')}"`).join(",")
+          )
+          .join("\n");
+      }
+
+      // 分页函数
+      function firstPage() {
+        if (currentPage > 1) {
+          currentPage = 1;
+          displayErrors();
+        }
+      }
+
+      function prevPage() {
+        if (currentPage > 1) {
+          currentPage--;
+          displayErrors();
+        }
+      }
+
+      function nextPage() {
+        const maxPage = Math.ceil(filteredErrors.length / pageSize);
+        if (currentPage < maxPage) {
+          currentPage++;
+          displayErrors();
+        }
+      }
+
+      function lastPage() {
+        const maxPage = Math.ceil(filteredErrors.length / pageSize);
+        if (currentPage < maxPage) {
+          currentPage = maxPage;
+          displayErrors();
+        }
+      }
+
+      // 工具函数
+      function formatDate(dateString) {
+        const date = new Date(dateString);
+        return date.toLocaleString("zh-CN");
+      }
+
+      function escapeHtml(text) {
+        const div = document.createElement("div");
+        div.textContent = text;
+        return div.innerHTML;
+      }
+
+      function showAlert(message, type) {
+        const alertDiv = document.createElement("div");
+        alertDiv.className = `alert alert-${type} alert-dismissible fade show position-fixed`;
+        alertDiv.style.top = "20px";
+        alertDiv.style.right = "20px";
+        alertDiv.style.zIndex = "9999";
+        alertDiv.innerHTML = `
+                ${message}
+                <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
+            `;
+
+        document.body.appendChild(alertDiv);
+
+        setTimeout(() => {
+          if (alertDiv.parentNode) {
+            alertDiv.remove();
+          }
+        }, 5000);
+      }
+
+      // 自动刷新
+      setInterval(() => {
+        loadErrorStats();
+      }, 30000); // 每30秒刷新统计
+    </script>
+  </body>
+</html>

@@ -443,3 +443,133 @@ func InitDevelopment() {
 	SetOutput(os.Stdout)
 	EnableCaller()
 }
+
+// 日志聚合相关方法
+
+// InitWithAggregation 初始化带聚合功能的日志系统
+func InitWithAggregation(logFile, aggregateDir, serviceName string, rotationSize int64, maxBackups int) error {
+	// 初始化基本配置
+	SetLevel(LevelInfo)
+	SetFormat(FormatJSON)
+	EnableCaller()
+
+	// 设置文件输出
+	if logFile != "" {
+		if err := SetFileOutput(logFile); err != nil {
+			return err
+		}
+	}
+
+	// 创建聚合器
+	aggregator, err := NewLogAggregator(aggregateDir, serviceName, rotationSize, maxBackups)
+	if err != nil {
+		return err
+	}
+
+	// 设置全局聚合器
+	SetGlobalAggregator(aggregator)
+
+	// 添加聚合Hook
+	hook := NewAggregatorHook(aggregator, serviceName)
+	Logrus.AddHook(hook)
+
+	return nil
+}
+
+// QueryLogsByTraceID 根据TraceID查询日志
+func QueryLogsByTraceID(traceID, logDir string, limit, offset int) (*LogQueryResult, error) {
+	query := LogQuery{
+		TraceID:  traceID,
+		Limit:    limit,
+		Offset:   offset,
+		UseIndex: true, // 启用索引
+	}
+	return QueryLogs(query, logDir)
+}
+
+// QueryLogsBySpanID 根据SpanID查询日志
+func QueryLogsBySpanID(spanID, logDir string, limit, offset int) (*LogQueryResult, error) {
+	query := LogQuery{
+		SpanID:   spanID,
+		Limit:    limit,
+		Offset:   offset,
+		UseIndex: true, // 启用索引
+	}
+	return QueryLogs(query, logDir)
+}
+
+// QueryLogsByTimeRange 根据时间范围查询日志
+func QueryLogsByTimeRange(startTime, endTime time.Time, logDir string, limit, offset int) (*LogQueryResult, error) {
+	query := LogQuery{
+		StartTime: startTime,
+		EndTime:   endTime,
+		Limit:     limit,
+		Offset:    offset,
+		UseIndex:  false, // 时间范围查询不使用索引
+	}
+	return QueryLogs(query, logDir)
+}
+
+// QueryLogsByLevel 根据日志级别查询
+func QueryLogsByLevel(level, logDir string, limit, offset int) (*LogQueryResult, error) {
+	query := LogQuery{
+		Level:    level,
+		Limit:    limit,
+		Offset:   offset,
+		UseIndex: true, // 启用索引
+	}
+	return QueryLogs(query, logDir)
+}
+
+// QueryLogsByService 根据服务名查询日志
+func QueryLogsByService(service, logDir string, limit, offset int) (*LogQueryResult, error) {
+	query := LogQuery{
+		Service:  service,
+		Limit:    limit,
+		Offset:   offset,
+		UseIndex: true, // 启用索引
+	}
+	return QueryLogs(query, logDir)
+}
+
+// QueryLogsByMessage 根据消息内容查询日志（支持正则表达式）
+func QueryLogsByMessage(message, logDir string, limit, offset int) (*LogQueryResult, error) {
+	query := LogQuery{
+		Message:  message,
+		Limit:    limit,
+		Offset:   offset,
+		UseIndex: false, // 消息内容查询不使用索引
+	}
+	return QueryLogs(query, logDir)
+}
+
+// QueryLogsWithIndex 使用索引的复杂查询
+func QueryLogsWithIndex(query LogQuery, logDir string) (*LogQueryResult, error) {
+	query.UseIndex = true
+	return QueryLogs(query, logDir)
+}
+
+// QueryLogsWithoutIndex 不使用索引的查询（强制文件扫描）
+func QueryLogsWithoutIndex(query LogQuery, logDir string) (*LogQueryResult, error) {
+	query.UseIndex = false
+	return QueryLogs(query, logDir)
+}
+
+// CleanupOldLogsDefault 清理一周前的日志文件
+func CleanupOldLogsDefault(logDir string) error {
+	return CleanupOldLogs(logDir, 7)
+}
+
+// GetLogStatsDefault 获取日志统计信息
+func GetLogStatsDefault(logDir string) (map[string]interface{}, error) {
+	return GetLogStats(logDir)
+}
+
+// CloseAggregator 关闭全局聚合器
+func CloseAggregator() error {
+	aggregator := GetGlobalAggregator()
+	if aggregator != nil {
+		return aggregator.Close()
+	}
+	return nil
+}

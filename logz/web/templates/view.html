@@ -1,0 +1,519 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>查看日志 - {{.Filename}}</title>
+    <link
+      href="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/css/bootstrap.min.css"
+      rel="stylesheet"
+    />
+    <link
+      href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.7.2/font/bootstrap-icons.css"
+      rel="stylesheet"
+    />
+    <link
+      href="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/themes/prism.min.css"
+      rel="stylesheet"
+    />
+    <style>
+      .log-content {
+        background-color: #f8f9fa;
+        border: 1px solid #dee2e6;
+        border-radius: 0.375rem;
+        font-family: "Courier New", monospace;
+        font-size: 0.9em;
+        line-height: 1.4;
+        max-height: 70vh;
+        overflow-y: auto;
+      }
+      .log-line {
+        padding: 2px 8px;
+        border-bottom: 1px solid #e9ecef;
+        white-space: pre-wrap;
+        word-break: break-all;
+      }
+      .log-line:hover {
+        background-color: #e9ecef;
+      }
+      .log-line.highlight {
+        background-color: #fff3cd;
+        border-left: 4px solid #ffc107;
+      }
+      .log-line.error {
+        background-color: #f8d7da;
+        border-left: 4px solid #dc3545;
+      }
+      .log-line.warn {
+        background-color: #fff3cd;
+        border-left: 4px solid #ffc107;
+      }
+      .log-line.info {
+        background-color: #d1ecf1;
+        border-left: 4px solid #17a2b8;
+      }
+      .pagination-info {
+        font-size: 0.9em;
+        color: #6c757d;
+      }
+      .search-highlight {
+        background-color: #ffeb3b;
+        padding: 1px 2px;
+        border-radius: 2px;
+      }
+      .controls-panel {
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        color: white;
+      }
+    </style>
+  </head>
+  <body>
+    <nav class="navbar navbar-expand-lg navbar-dark bg-dark">
+      <div class="container">
+        <a class="navbar-brand" href="/">
+          <i class="bi bi-journal-text"></i> 日志管理系统
+        </a>
+        <div class="navbar-nav ms-auto">
+          <a class="nav-link" href="/"><i class="bi bi-house"></i> 首页</a>
+          <a class="nav-link" href="/errors"
+            ><i class="bi bi-exclamation-triangle"></i> 错误日志</a
+          >
+        </div>
+      </div>
+    </nav>
+
+    <div class="container mt-4">
+      <!-- 文件信息 -->
+      <div class="card mb-4">
+        <div class="card-header">
+          <div class="d-flex justify-content-between align-items-center">
+            <h5 class="mb-0">
+              <i class="bi bi-file-earmark-text"></i>
+              查看日志文件: <code>{{.Filename}}</code>
+            </h5>
+            <a href="/" class="btn btn-outline-secondary btn-sm">
+              <i class="bi bi-arrow-left"></i> 返回
+            </a>
+          </div>
+        </div>
+      </div>
+
+      <!-- 控制面板 -->
+      <div class="card controls-panel mb-4">
+        <div class="card-body">
+          <div class="row">
+            <div class="col-md-4">
+              <label for="searchInput" class="form-label text-white"
+                >搜索内容:</label
+              >
+              <div class="input-group">
+                <input
+                  type="text"
+                  class="form-control"
+                  id="searchInput"
+                  placeholder="输入搜索关键词..."
+                />
+                <button
+                  class="btn btn-light"
+                  type="button"
+                  onclick="searchContent()"
+                >
+                  <i class="bi bi-search"></i>
+                </button>
+              </div>
+            </div>
+            <div class="col-md-2">
+              <label for="levelFilter" class="form-label text-white"
+                >级别过滤:</label
+              >
+              <select
+                class="form-select"
+                id="levelFilter"
+                onchange="filterByLevel()"
+              >
+                <option value="">全部级别</option>
+                <option value="error">Error</option>
+                <option value="warn">Warn</option>
+                <option value="info">Info</option>
+                <option value="debug">Debug</option>
+              </select>
+            </div>
+            <div class="col-md-2">
+              <label for="pageSize" class="form-label text-white"
+                >每页行数:</label
+              >
+              <select
+                class="form-select"
+                id="pageSize"
+                onchange="changePageSize()"
+              >
+                <option value="100">100</option>
+                <option value="500" selected>500</option>
+                <option value="1000">1000</option>
+                <option value="2000">2000</option>
+              </select>
+            </div>
+            <div class="col-md-2">
+              <label for="autoRefresh" class="form-label text-white"
+                >自动刷新:</label
+              >
+              <div class="form-check form-switch">
+                <input
+                  class="form-check-input"
+                  type="checkbox"
+                  id="autoRefresh"
+                  onchange="toggleAutoRefresh()"
+                />
+                <label class="form-check-label text-white" for="autoRefresh"
+                  >启用</label
+                >
+              </div>
+            </div>
+            <div class="col-md-2">
+              <label class="form-label text-white">&nbsp;</label>
+              <div>
+                <button class="btn btn-light btn-sm" onclick="refreshContent()">
+                  <i class="bi bi-arrow-clockwise"></i> 刷新
+                </button>
+                <button class="btn btn-light btn-sm" onclick="downloadFile()">
+                  <i class="bi bi-download"></i> 下载
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 分页信息 -->
+      <div class="d-flex justify-content-between align-items-center mb-3">
+        <div class="pagination-info">
+          显示第 <span id="startLine">1</span> -
+          <span id="endLine">500</span> 行， 共
+          <span id="totalLines">0</span> 行
+        </div>
+        <div class="btn-group" role="group">
+          <button class="btn btn-outline-primary btn-sm" onclick="firstPage()">
+            <i class="bi bi-chevron-double-left"></i>
+          </button>
+          <button class="btn btn-outline-primary btn-sm" onclick="prevPage()">
+            <i class="bi bi-chevron-left"></i>
+          </button>
+          <span class="btn btn-outline-secondary btn-sm disabled">
+            第 <span id="currentPage">1</span> 页
+          </span>
+          <button class="btn btn-outline-primary btn-sm" onclick="nextPage()">
+            <i class="bi bi-chevron-right"></i>
+          </button>
+          <button class="btn btn-outline-primary btn-sm" onclick="lastPage()">
+            <i class="bi bi-chevron-double-right"></i>
+          </button>
+        </div>
+      </div>
+
+      <!-- 日志内容 -->
+      <div class="card">
+        <div class="card-body p-0">
+          <div id="logContent" class="log-content">
+            <!-- 日志内容将通过JavaScript动态加载 -->
+          </div>
+        </div>
+      </div>
+
+      <!-- 搜索统计 -->
+      <div class="mt-3" id="searchStats" style="display: none">
+        <div class="alert alert-info">
+          <i class="bi bi-search"></i>
+          找到 <span id="searchCount">0</span> 个匹配项
+          <button
+            class="btn btn-sm btn-outline-primary ms-2"
+            onclick="nextSearch()"
+          >
+            下一个
+          </button>
+          <button
+            class="btn btn-sm btn-outline-secondary ms-1"
+            onclick="prevSearch()"
+          >
+            上一个
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/js/bootstrap.bundle.min.js"></script>
+    <script>
+      let currentPage = 1;
+      let pageSize = 500;
+      let totalLines = 0;
+      let currentSearchIndex = -1;
+      let searchResults = [];
+      let autoRefreshInterval = null;
+      let filename = "{{.Filename}}";
+
+      // 页面加载时初始化
+      document.addEventListener("DOMContentLoaded", function () {
+        loadLogContent();
+      });
+
+      // 加载日志内容
+      async function loadLogContent() {
+        try {
+          const searchTerm = document.getElementById("searchInput").value;
+          const url = `/api/files/content/${encodeURIComponent(
+            filename
+          )}?limit=${pageSize}&offset=${
+            (currentPage - 1) * pageSize
+          }&search=${encodeURIComponent(searchTerm)}`;
+
+          const response = await fetch(url);
+          const result = await response.json();
+
+          if (result.success) {
+            displayLogContent(result.data);
+          } else {
+            showAlert("加载日志内容失败: " + result.error, "danger");
+          }
+        } catch (error) {
+          console.error("加载日志内容失败:", error);
+          showAlert("加载日志内容失败: " + error.message, "danger");
+        }
+      }
+
+      // 显示日志内容
+      function displayLogContent(data) {
+        const logContent = document.getElementById("logContent");
+        totalLines = data.total;
+
+        // 更新分页信息
+        document.getElementById("startLine").textContent =
+          (currentPage - 1) * pageSize + 1;
+        document.getElementById("endLine").textContent = Math.min(
+          currentPage * pageSize,
+          totalLines
+        );
+        document.getElementById("totalLines").textContent = totalLines;
+        document.getElementById("currentPage").textContent = currentPage;
+
+        // 显示日志行
+        if (data.content && data.content.length > 0) {
+          logContent.innerHTML = data.content
+            .map((line, index) => {
+              const lineNumber = (currentPage - 1) * pageSize + index + 1;
+              const level = getLogLevel(line);
+              const highlightedLine = highlightSearch(
+                line,
+                document.getElementById("searchInput").value
+              );
+
+              return `<div class="log-line ${level}" data-line="${lineNumber}">${highlightedLine}</div>`;
+            })
+            .join("");
+        } else {
+          logContent.innerHTML = '<div class="p-3 text-muted">暂无内容</div>';
+        }
+      }
+
+      // 获取日志级别
+      function getLogLevel(line) {
+        const lowerLine = line.toLowerCase();
+        if (
+          lowerLine.includes('"level":"error"') ||
+          lowerLine.includes('"level":"fatal"')
+        ) {
+          return "error";
+        } else if (lowerLine.includes('"level":"warn"')) {
+          return "warn";
+        } else if (lowerLine.includes('"level":"info"')) {
+          return "info";
+        }
+        return "";
+      }
+
+      // 高亮搜索内容
+      function highlightSearch(text, searchTerm) {
+        if (!searchTerm) return text;
+
+        const regex = new RegExp(
+          `(${searchTerm.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")})`,
+          "gi"
+        );
+        return text.replace(regex, '<span class="search-highlight">$1</span>');
+      }
+
+      // 搜索内容
+      function searchContent() {
+        currentPage = 1;
+        loadLogContent();
+      }
+
+      // 按级别过滤
+      function filterByLevel() {
+        const level = document.getElementById("levelFilter").value;
+        const lines = document.querySelectorAll(".log-line");
+
+        lines.forEach((line) => {
+          if (!level || line.classList.contains(level)) {
+            line.style.display = "block";
+          } else {
+            line.style.display = "none";
+          }
+        });
+      }
+
+      // 改变页面大小
+      function changePageSize() {
+        pageSize = parseInt(document.getElementById("pageSize").value);
+        currentPage = 1;
+        loadLogContent();
+      }
+
+      // 切换自动刷新
+      function toggleAutoRefresh() {
+        const autoRefresh = document.getElementById("autoRefresh").checked;
+
+        if (autoRefresh) {
+          autoRefreshInterval = setInterval(loadLogContent, 5000); // 每5秒刷新
+        } else {
+          if (autoRefreshInterval) {
+            clearInterval(autoRefreshInterval);
+            autoRefreshInterval = null;
+          }
+        }
+      }
+
+      // 刷新内容
+      function refreshContent() {
+        loadLogContent();
+      }
+
+      // 下载文件
+      function downloadFile() {
+        const link = document.createElement("a");
+        link.href = `/api/files/content/${encodeURIComponent(
+          filename
+        )}?limit=0&offset=0`;
+        link.download = filename;
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+      }
+
+      // 分页函数
+      function firstPage() {
+        if (currentPage > 1) {
+          currentPage = 1;
+          loadLogContent();
+        }
+      }
+
+      function prevPage() {
+        if (currentPage > 1) {
+          currentPage--;
+          loadLogContent();
+        }
+      }
+
+      function nextPage() {
+        const maxPage = Math.ceil(totalLines / pageSize);
+        if (currentPage < maxPage) {
+          currentPage++;
+          loadLogContent();
+        }
+      }
+
+      function lastPage() {
+        const maxPage = Math.ceil(totalLines / pageSize);
+        if (currentPage < maxPage) {
+          currentPage = maxPage;
+          loadLogContent();
+        }
+      }
+
+      // 搜索导航
+      function nextSearch() {
+        if (searchResults.length > 0) {
+          currentSearchIndex = (currentSearchIndex + 1) % searchResults.length;
+          highlightSearchResult();
+        }
+      }
+
+      function prevSearch() {
+        if (searchResults.length > 0) {
+          currentSearchIndex =
+            currentSearchIndex <= 0
+              ? searchResults.length - 1
+              : currentSearchIndex - 1;
+          highlightSearchResult();
+        }
+      }
+
+      function highlightSearchResult() {
+        // 移除之前的高亮
+        document.querySelectorAll(".log-line.highlight").forEach((line) => {
+          line.classList.remove("highlight");
+        });
+
+        if (
+          currentSearchIndex >= 0 &&
+          currentSearchIndex < searchResults.length
+        ) {
+          const targetLine = searchResults[currentSearchIndex];
+          const lineElement = document.querySelector(
+            `[data-line="${targetLine}"]`
+          );
+          if (lineElement) {
+            lineElement.classList.add("highlight");
+            lineElement.scrollIntoView({ behavior: "smooth", block: "center" });
+          }
+        }
+      }
+
+      // 显示提示信息
+      function showAlert(message, type) {
+        const alertDiv = document.createElement("div");
+        alertDiv.className = `alert alert-${type} alert-dismissible fade show position-fixed`;
+        alertDiv.style.top = "20px";
+        alertDiv.style.right = "20px";
+        alertDiv.style.zIndex = "9999";
+        alertDiv.innerHTML = `
+                ${message}
+                <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
+            `;
+
+        document.body.appendChild(alertDiv);
+
+        setTimeout(() => {
+          if (alertDiv.parentNode) {
+            alertDiv.remove();
+          }
+        }, 5000);
+      }
+
+      // 键盘快捷键
+      document.addEventListener("keydown", function (e) {
+        if (e.ctrlKey || e.metaKey) {
+          switch (e.key) {
+            case "f":
+              e.preventDefault();
+              document.getElementById("searchInput").focus();
+              break;
+            case "r":
+              e.preventDefault();
+              refreshContent();
+              break;
+          }
+        } else {
+          switch (e.key) {
+            case "F3":
+            case "Enter":
+              if (document.activeElement.id === "searchInput") {
+                e.preventDefault();
+                searchContent();
+              }
+              break;
+          }
+        }
+      });
+    </script>
+  </body>
+</html>
