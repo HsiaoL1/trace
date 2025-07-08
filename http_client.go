@@ -2,6 +2,7 @@ package trace
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -24,43 +25,86 @@ func NewTracedHTTPClient(timeout time.Duration) *TracedHTTPClient {
 
 // Do 执行HTTP请求，自动传递追踪上下文
 func (c *TracedHTTPClient) Do(ctx context.Context, req *http.Request) (*http.Response, error) {
-	// 从context中获取追踪上下文
-	traceCtx := GetTraceContextFromContext(ctx)
-
-	// 如果context中没有追踪上下文，创建一个根span
-	if !traceCtx.IsValid() {
-		traceCtx = CreateRootSpan()
+	if req == nil {
+		return nil, fmt.Errorf("request cannot be nil")
 	}
 
-	// 将追踪上下文设置到HTTP头部
+	// 创建HTTP客户端span
+	ctx, span := StartHTTPClientSpan(ctx, req.Method, req.URL.String())
+	defer func() {
+		if span != nil {
+			span.End()
+		}
+	}()
+
+	// 注入OpenTelemetry追踪上下文到请求头
+	InjectTraceContext(ctx, req)
+
+	// 从context中获取自定义追踪上下文（向后兼容）
+	traceCtx := GetTraceContextFromContext(ctx)
+	if !traceCtx.IsValid() {
+		traceCtx = CreateRootSpan()
+		ctx = WithTraceContext(ctx, traceCtx)
+	}
+
+	// 设置自定义追踪头部（向后兼容）
+	ctx = WithHttpRequest(ctx, req)
 	SetTraceContextToHttpHeader(ctx, traceCtx)
 
 	// 执行HTTP请求
-	return c.client.Do(req)
+	resp, err := c.client.Do(req.WithContext(ctx))
+
+	// 完成span
+	FinishHTTPClientSpan(span, resp, err)
+
+	return resp, err
 }
 
 // Get 执行GET请求
 func (c *TracedHTTPClient) Get(ctx context.Context, url string) (*http.Response, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if url == "" {
+		return nil, fmt.Errorf("URL cannot be empty")
+	}
+
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to create GET request: %w", err)
 	}
 	return c.Do(ctx, req)
 }
 
 // Post 执行POST请求
 func (c *TracedHTTPClient) Post(ctx context.Context, url, contentType string, body io.Reader) (*http.Response, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if url == "" {
+		return nil, fmt.Errorf("URL cannot be empty")
+	}
+	if contentType == "" {
+		contentType = "application/octet-stream"
+	}
+
 	req, err := http.NewRequestWithContext(ctx, "POST", url, body)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to create POST request: %w", err)
 	}
 	req.Header.Set("Content-Type", contentType)
 	return c.Do(ctx, req)
 }
 
 // HTTPMiddleware HTTP中间件，用于自动处理追踪上下文
+// 注意：推荐使用 OpenTelemetryMiddleware 更标准的中间件
 func HTTPMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if next == nil {
+			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+			return
+		}
+
 		// 从HTTP头部获取追踪上下文
 		traceCtx := GetTraceContextFromHttpHeader(r)
 

@@ -3,7 +3,9 @@ package logz
 import (
 	"bufio"
 	"compress/gzip"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -46,7 +48,7 @@ type LogAggregator struct {
 	maxBackups    int
 	aggregateFile *os.File
 	writer        *bufio.Writer
-	mutex         sync.Mutex
+	mutex         sync.RWMutex
 	lastRotation  time.Time
 	currentFileID string
 	currentOffset int64
@@ -56,13 +58,26 @@ type LogAggregator struct {
 	indexMutex sync.RWMutex
 
 	// 批量写入
-	batchSize   int
-	batchBuffer []LogEntry
-	batchMutex  sync.Mutex
+	batchSize     int
+	batchBuffer   []LogEntry
+	batchMutex    sync.Mutex
+	batchTicker   *time.Ticker
+	flushInterval time.Duration
 
 	// 压缩相关
 	compressAfter time.Duration
 	compressMutex sync.Mutex
+
+	// 生命周期管理
+	ctx       context.Context
+	cancel    context.CancelFunc
+	done      chan struct{}
+	closed    bool
+	closeMutex sync.Mutex
+
+	// 索引工作队列
+	indexQueue   chan LogEntry
+	indexWorkers int
 }
 
 // LogQuery 日志查询条件
@@ -96,38 +111,57 @@ type IndexEntry struct {
 
 // NewLogAggregator 创建新的日志聚合器
 func NewLogAggregator(outputDir, serviceName string, rotationSize int64, maxBackups int) (*LogAggregator, error) {
+	// 参数验证
+	if outputDir == "" {
+		return nil, errors.New("输出目录不能为空")
+	}
+	if serviceName == "" {
+		return nil, errors.New("服务名不能为空")
+	}
+	if rotationSize <= 0 {
+		rotationSize = 100 * 1024 * 1024 // 100MB
+	}
+	if maxBackups <= 0 {
+		maxBackups = 10
+	}
+
 	// 确保输出目录存在
 	if err := os.MkdirAll(outputDir, 0755); err != nil {
-		return nil, fmt.Errorf("创建日志聚合目录失败: %v", err)
+		return nil, fmt.Errorf("创建日志聚合目录失败: %w", err)
 	}
 
 	// 创建索引目录
 	indexDir := filepath.Join(outputDir, "index")
 	if err := os.MkdirAll(indexDir, 0755); err != nil {
-		return nil, fmt.Errorf("创建索引目录失败: %v", err)
+		return nil, fmt.Errorf("创建索引目录失败: %w", err)
 	}
 
 	// 打开索引数据库
-	indexDB, err := bbolt.Open(filepath.Join(indexDir, serviceName+".db"), 0600, &bbolt.Options{Timeout: 1 * time.Second})
+	indexDB, err := bbolt.Open(filepath.Join(indexDir, serviceName+".db"), 0600, &bbolt.Options{
+		Timeout: 5 * time.Second,
+		NoSync:  false,
+	})
 	if err != nil {
-		return nil, fmt.Errorf("打开索引数据库失败: %v", err)
+		return nil, fmt.Errorf("打开索引数据库失败: %w", err)
 	}
 
 	// 初始化索引桶
 	err = indexDB.Update(func(tx *bbolt.Tx) error {
 		buckets := []string{"trace_id", "span_id", "level", "service", "time"}
 		for _, bucket := range buckets {
-			_, err := tx.CreateBucketIfNotExists([]byte(bucket))
-			if err != nil {
-				return err
+			if _, err := tx.CreateBucketIfNotExists([]byte(bucket)); err != nil {
+				return fmt.Errorf("创建索引桶%s失败: %w", bucket, err)
 			}
 		}
 		return nil
 	})
 	if err != nil {
 		indexDB.Close()
-		return nil, fmt.Errorf("初始化索引桶失败: %v", err)
+		return nil, err
 	}
+
+	// 创建上下文
+	ctx, cancel := context.WithCancel(context.Background())
 
 	aggregator := &LogAggregator{
 		outputDir:     outputDir,
@@ -136,19 +170,26 @@ func NewLogAggregator(outputDir, serviceName string, rotationSize int64, maxBack
 		maxBackups:    maxBackups,
 		lastRotation:  time.Now(),
 		indexDB:       indexDB,
-		batchSize:     100, // 批量写入大小
+		batchSize:     100,
 		batchBuffer:   make([]LogEntry, 0, 100),
-		compressAfter: 24 * time.Hour, // 24小时后压缩
+		flushInterval: 5 * time.Second,
+		compressAfter: 24 * time.Hour,
+		ctx:           ctx,
+		cancel:        cancel,
+		done:          make(chan struct{}),
+		indexQueue:    make(chan LogEntry, 1000), // 缓冲队列
+		indexWorkers:  2,                        // 索引工作线程数
 	}
 
 	// 初始化聚合文件
 	if err := aggregator.initializeFile(); err != nil {
+		cancel()
 		indexDB.Close()
 		return nil, err
 	}
 
 	// 启动后台任务
-	go aggregator.backgroundTasks()
+	aggregator.startBackgroundTasks()
 
 	return aggregator, nil
 }
@@ -159,9 +200,15 @@ func (la *LogAggregator) initializeFile() error {
 	defer la.mutex.Unlock()
 
 	// 关闭现有文件
+	if la.writer != nil {
+		if err := la.writer.Flush(); err != nil {
+			return fmt.Errorf("刷新缓冲区失败: %w", err)
+		}
+	}
 	if la.aggregateFile != nil {
-		la.writer.Flush()
-		la.aggregateFile.Close()
+		if err := la.aggregateFile.Close(); err != nil {
+			return fmt.Errorf("关闭文件失败: %w", err)
+		}
 	}
 
 	// 生成文件ID
@@ -171,15 +218,20 @@ func (la *LogAggregator) initializeFile() error {
 
 	// 创建新的聚合文件
 	filename := la.currentFileID + ".log"
-	filepath := filepath.Join(la.outputDir, filename)
+	filePath := filepath.Join(la.outputDir, filename)
 
-	file, err := os.OpenFile(filepath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
+	file, err := os.OpenFile(filePath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 	if err != nil {
-		return fmt.Errorf("创建聚合日志文件失败: %v", err)
+		return fmt.Errorf("创建聚合日志文件失败: %w", err)
+	}
+
+	// 获取文件当前大小作为偏移量
+	if stat, err := file.Stat(); err == nil {
+		la.currentOffset = stat.Size()
 	}
 
 	la.aggregateFile = file
-	la.writer = bufio.NewWriter(file)
+	la.writer = bufio.NewWriterSize(file, 32*1024) // 32KB缓冲
 	return nil
 }
 
@@ -190,17 +242,37 @@ func (la *LogAggregator) getFileSequence(date time.Time) int {
 	if err != nil {
 		return 1
 	}
-	return len(files) + 1
+	
+	// 过滤压缩文件
+	var validFiles []string
+	for _, file := range files {
+		if !strings.HasSuffix(file, ".gz") {
+			validFiles = append(validFiles, file)
+		}
+	}
+	
+	return len(validFiles) + 1
 }
 
 // WriteLog 写入日志到聚合文件
 func (la *LogAggregator) WriteLog(entry LogEntry) error {
+	// 检查是否已关闭
+	la.closeMutex.Lock()
+	if la.closed {
+		la.closeMutex.Unlock()
+		return errors.New("聚合器已关闭")
+	}
+	la.closeMutex.Unlock()
+
 	la.batchMutex.Lock()
 	defer la.batchMutex.Unlock()
 
 	// 设置文件信息
 	entry.FileID = la.currentFileID
 	entry.Offset = la.currentOffset
+	if entry.Timestamp == "" {
+		entry.Timestamp = time.Now().Format(time.RFC3339)
+	}
 
 	// 添加到批量缓冲区
 	la.batchBuffer = append(la.batchBuffer, entry)
@@ -208,7 +280,7 @@ func (la *LogAggregator) WriteLog(entry LogEntry) error {
 	// 检查是否需要轮转文件
 	if la.shouldRotate() {
 		if err := la.rotateFile(); err != nil {
-			return err
+			return fmt.Errorf("轮转文件失败: %w", err)
 		}
 	}
 
@@ -229,86 +301,101 @@ func (la *LogAggregator) flushBatch() error {
 	la.mutex.Lock()
 	defer la.mutex.Unlock()
 
+	// 为本次批量做备份
+	batchToWrite := make([]LogEntry, len(la.batchBuffer))
+	copy(batchToWrite, la.batchBuffer)
+
+	// 先清空缓冲区，避免长时间锁定
+	la.batchBuffer = la.batchBuffer[:0]
+
 	// 写入所有条目
-	for _, entry := range la.batchBuffer {
+	for _, entry := range batchToWrite {
 		// 序列化日志条目
 		data, err := json.Marshal(entry)
 		if err != nil {
-			return fmt.Errorf("序列化日志条目失败: %v", err)
+			return fmt.Errorf("序列化日志条目失败: %w", err)
 		}
 
 		// 写入文件
-		if _, err := la.writer.Write(append(data, '\n')); err != nil {
-			return fmt.Errorf("写入日志文件失败: %v", err)
+		line := append(data, '\n')
+		if _, err := la.writer.Write(line); err != nil {
+			return fmt.Errorf("写入日志文件失败: %w", err)
 		}
 
 		// 更新偏移量
-		la.currentOffset += int64(len(data) + 1)
+		la.currentOffset += int64(len(line))
 
-		// 添加到索引
-		la.addToIndex(entry)
+		// 异步添加到索引队列
+		select {
+		case la.indexQueue <- entry:
+		case <-la.ctx.Done():
+			return la.ctx.Err()
+		default:
+			// 队列已满，跳过索引
+		}
 	}
 
 	// 刷新缓冲区
-	la.writer.Flush()
-
-	// 清空批量缓冲区
-	la.batchBuffer = la.batchBuffer[:0]
+	if err := la.writer.Flush(); err != nil {
+		return fmt.Errorf("刷新文件缓冲区失败: %w", err)
+	}
 
 	return nil
 }
 
-// addToIndex 添加到索引
-func (la *LogAggregator) addToIndex(entry LogEntry) {
-	la.indexMutex.Lock()
-	defer la.indexMutex.Unlock()
-
-	// 异步添加到索引
-	go func() {
-		la.indexDB.Update(func(tx *bbolt.Tx) error {
-			// 添加TraceID索引
-			if entry.TraceID != "" {
-				bucket := tx.Bucket([]byte("trace_id"))
-				key := []byte(entry.TraceID)
-				value := fmt.Sprintf("%s:%d", entry.FileID, entry.Offset)
-				bucket.Put(key, []byte(value))
+// addToIndex 添加到索引（在工作线程中调用）
+func (la *LogAggregator) addToIndex(entry LogEntry) error {
+	return la.indexDB.Update(func(tx *bbolt.Tx) error {
+		value := fmt.Sprintf("%s:%d", entry.FileID, entry.Offset)
+		
+		// 添加TraceID索引
+		if entry.TraceID != "" {
+			if bucket := tx.Bucket([]byte("trace_id")); bucket != nil {
+				if err := bucket.Put([]byte(entry.TraceID), []byte(value)); err != nil {
+					return fmt.Errorf("添加TraceID索引失败: %w", err)
+				}
 			}
+		}
 
-			// 添加SpanID索引
-			if entry.SpanID != "" {
-				bucket := tx.Bucket([]byte("span_id"))
-				key := []byte(entry.SpanID)
-				value := fmt.Sprintf("%s:%d", entry.FileID, entry.Offset)
-				bucket.Put(key, []byte(value))
+		// 添加SpanID索引
+		if entry.SpanID != "" {
+			if bucket := tx.Bucket([]byte("span_id")); bucket != nil {
+				if err := bucket.Put([]byte(entry.SpanID), []byte(value)); err != nil {
+					return fmt.Errorf("添加SpanID索引失败: %w", err)
+				}
 			}
+		}
 
-			// 添加级别索引
-			if entry.Level != "" {
-				bucket := tx.Bucket([]byte("level"))
-				key := []byte(strings.ToLower(entry.Level))
-				value := fmt.Sprintf("%s:%d", entry.FileID, entry.Offset)
-				bucket.Put(key, []byte(value))
+		// 添加级别索引
+		if entry.Level != "" {
+			if bucket := tx.Bucket([]byte("level")); bucket != nil {
+				key := strings.ToLower(entry.Level)
+				if err := bucket.Put([]byte(key), []byte(value)); err != nil {
+					return fmt.Errorf("添加级别索引失败: %w", err)
+				}
 			}
+		}
 
-			// 添加服务索引
-			if entry.Service != "" {
-				bucket := tx.Bucket([]byte("service"))
-				key := []byte(entry.Service)
-				value := fmt.Sprintf("%s:%d", entry.FileID, entry.Offset)
-				bucket.Put(key, []byte(value))
+		// 添加服务索引
+		if entry.Service != "" {
+			if bucket := tx.Bucket([]byte("service")); bucket != nil {
+				if err := bucket.Put([]byte(entry.Service), []byte(value)); err != nil {
+					return fmt.Errorf("添加服务索引失败: %w", err)
+				}
 			}
+		}
 
-			// 添加时间索引
-			if entry.Timestamp != "" {
-				bucket := tx.Bucket([]byte("time"))
-				key := []byte(entry.Timestamp)
-				value := fmt.Sprintf("%s:%d", entry.FileID, entry.Offset)
-				bucket.Put(key, []byte(value))
+		// 添加时间索引
+		if entry.Timestamp != "" {
+			if bucket := tx.Bucket([]byte("time")); bucket != nil {
+				if err := bucket.Put([]byte(entry.Timestamp), []byte(value)); err != nil {
+					return fmt.Errorf("添加时间索引失败: %w", err)
+				}
 			}
+		}
 
-			return nil
-		})
-	}()
+		return nil
+	})
 }
 
 // shouldRotate 检查是否需要轮转文件
@@ -316,35 +403,50 @@ func (la *LogAggregator) shouldRotate() bool {
 	// 检查文件大小
 	if la.aggregateFile != nil {
 		if stat, err := la.aggregateFile.Stat(); err == nil {
-			if stat.Size() > la.rotationSize {
+			if stat.Size() >= la.rotationSize {
 				return true
 			}
 		}
 	}
 
-	// 检查日期变化
+	// 检查日期变化（跨天轮转）
 	now := time.Now()
-	return now.Day() != la.lastRotation.Day()
+	return now.Day() != la.lastRotation.Day() || now.Month() != la.lastRotation.Month() || now.Year() != la.lastRotation.Year()
 }
 
 // rotateFile 轮转文件
 func (la *LogAggregator) rotateFile() error {
 	// 刷新批量缓冲区
 	if err := la.flushBatch(); err != nil {
-		return err
+		return fmt.Errorf("轮转前刷新失败: %w", err)
 	}
 
-	// 刷新当前文件
-	la.writer.Flush()
-	la.aggregateFile.Close()
+	// 刷新并关闭当前文件
+	if la.writer != nil {
+		if err := la.writer.Flush(); err != nil {
+			return fmt.Errorf("刷新文件失败: %w", err)
+		}
+	}
+	if la.aggregateFile != nil {
+		if err := la.aggregateFile.Close(); err != nil {
+			return fmt.Errorf("关闭文件失败: %w", err)
+		}
+	}
 
 	// 清理旧文件
 	if err := la.cleanupOldFiles(); err != nil {
-		return err
+		// 清理失败不影响轮转操作
+		fmt.Fprintf(os.Stderr, "[清理旧文件错误] %v\n", err)
 	}
 
 	// 初始化新文件
-	return la.initializeFile()
+	if err := la.initializeFile(); err != nil {
+		return fmt.Errorf("初始化新文件失败: %w", err)
+	}
+
+	// 更新轮转时间
+	la.lastRotation = time.Now()
+	return nil
 }
 
 // cleanupOldFiles 清理旧文件
@@ -368,17 +470,70 @@ func (la *LogAggregator) cleanupOldFiles() error {
 	return nil
 }
 
-// backgroundTasks 后台任务
-func (la *LogAggregator) backgroundTasks() {
-	ticker := time.NewTicker(5 * time.Minute)
-	defer ticker.Stop()
+// startBackgroundTasks 启动后台任务
+func (la *LogAggregator) startBackgroundTasks() {
+	// 启动索引工作线程
+	for i := 0; i < la.indexWorkers; i++ {
+		go la.indexWorker()
+	}
 
-	for range ticker.C {
-		// 定期刷新批量缓冲区
-		la.flushBatch()
+	// 启动定时刷新任务
+	la.batchTicker = time.NewTicker(la.flushInterval)
+	go la.flushTask()
 
-		// 压缩旧文件
-		la.compressOldFiles()
+	// 启动清理和压缩任务
+	go la.maintenanceTask()
+}
+
+// indexWorker 索引工作线程
+func (la *LogAggregator) indexWorker() {
+	for {
+		select {
+		case entry := <-la.indexQueue:
+			if err := la.addToIndex(entry); err != nil {
+				// 索引失败不影响主流程，只记录错误
+				fmt.Fprintf(os.Stderr, "[索引错误] %v\n", err)
+			}
+		case <-la.ctx.Done():
+			return
+		}
+	}
+}
+
+// flushTask 定时刷新任务
+func (la *LogAggregator) flushTask() {
+	defer la.batchTicker.Stop()
+	
+	for {
+		select {
+		case <-la.batchTicker.C:
+			if err := la.flushBatch(); err != nil {
+				fmt.Fprintf(os.Stderr, "[刷新错误] %v\n", err)
+			}
+		case <-la.ctx.Done():
+			return
+		}
+	}
+}
+
+// maintenanceTask 维护任务（清理和压缩）
+func (la *LogAggregator) maintenanceTask() {
+	maintenanceTicker := time.NewTicker(1 * time.Hour)
+	defer maintenanceTicker.Stop()
+
+	for {
+		select {
+		case <-maintenanceTicker.C:
+			// 压缩旧文件
+			la.compressOldFiles()
+			
+			// 清理过期文件
+			if err := la.cleanupOldFiles(); err != nil {
+				fmt.Fprintf(os.Stderr, "[清理错误] %v\n", err)
+			}
+		case <-la.ctx.Done():
+			return
+		}
 	}
 }
 
@@ -389,36 +544,47 @@ func (la *LogAggregator) compressOldFiles() {
 
 	cutoffTime := time.Now().Add(-la.compressAfter)
 
-	files, err := filepath.Glob(filepath.Join(la.outputDir, la.serviceName+"_*.log"))
+	pattern := filepath.Join(la.outputDir, la.serviceName+"_*.log")
+	files, err := filepath.Glob(pattern)
 	if err != nil {
+		fmt.Fprintf(os.Stderr, "[获取文件列表错误] %v\n", err)
 		return
 	}
 
 	for _, file := range files {
-		if stat, err := os.Stat(file); err == nil {
-			if stat.ModTime().Before(cutoffTime) {
-				// 检查是否已经压缩
-				if !strings.HasSuffix(file, ".gz") {
-					la.compressFile(file)
-				}
+		// 跳过当前正在写入的文件
+		if strings.Contains(file, la.currentFileID) {
+			continue
+		}
+
+		stat, err := os.Stat(file)
+		if err != nil {
+			continue
+		}
+
+		// 检查文件是否过期且未压缩
+		if stat.ModTime().Before(cutoffTime) && !strings.HasSuffix(file, ".gz") {
+			if err := la.compressFile(file); err != nil {
+				fmt.Fprintf(os.Stderr, "[压缩文件错误] %s: %v\n", file, err)
 			}
 		}
 	}
 }
 
 // compressFile 压缩文件
-func (la *LogAggregator) compressFile(filepath string) {
+func (la *LogAggregator) compressFile(filePath string) error {
 	// 打开原文件
-	file, err := os.Open(filepath)
+	file, err := os.Open(filePath)
 	if err != nil {
-		return
+		return fmt.Errorf("打开文件失败: %w", err)
 	}
 	defer file.Close()
 
 	// 创建压缩文件
-	gzFile, err := os.Create(filepath + ".gz")
+	gzPath := filePath + ".gz"
+	gzFile, err := os.Create(gzPath)
 	if err != nil {
-		return
+		return fmt.Errorf("创建压缩文件失败: %w", err)
 	}
 	defer gzFile.Close()
 
@@ -429,30 +595,78 @@ func (la *LogAggregator) compressFile(filepath string) {
 	// 复制内容
 	_, err = io.Copy(gzWriter, file)
 	if err != nil {
-		return
+		// 清理已创建的压缩文件
+		os.Remove(gzPath)
+		return fmt.Errorf("压缩文件失败: %w", err)
+	}
+
+	// 确保数据写入磁盘
+	if err := gzWriter.Close(); err != nil {
+		os.Remove(gzPath)
+		return fmt.Errorf("关闭压缩文件失败: %w", err)
+	}
+	if err := gzFile.Sync(); err != nil {
+		os.Remove(gzPath)
+		return fmt.Errorf("同步压缩文件失败: %w", err)
 	}
 
 	// 删除原文件
-	os.Remove(filepath)
+	if err := os.Remove(filePath); err != nil {
+		return fmt.Errorf("删除原文件失败: %w", err)
+	}
+
+	return nil
 }
 
 // Close 关闭聚合器
 func (la *LogAggregator) Close() error {
-	la.mutex.Lock()
-	defer la.mutex.Unlock()
+	la.closeMutex.Lock()
+	defer la.closeMutex.Unlock()
+	
+	if la.closed {
+		return nil // 已经关闭
+	}
+	la.closed = true
 
-	// 刷新批量缓冲区
+	// 取消上下文，停止所有后台任务
+	la.cancel()
+
+	// 等待后台任务结束
+	select {
+	case <-la.done:
+	case <-time.After(10 * time.Second):
+		// 超时保护
+	}
+
+	// 最后一次刷新批量缓冲区
+	la.batchMutex.Lock()
 	la.flushBatch()
+	la.batchMutex.Unlock()
 
+	// 关闭文件
+	la.mutex.Lock()
 	if la.writer != nil {
 		la.writer.Flush()
+		la.writer = nil
 	}
 	if la.aggregateFile != nil {
 		la.aggregateFile.Close()
+		la.aggregateFile = nil
 	}
+	la.mutex.Unlock()
+
+	// 关闭索引数据库
 	if la.indexDB != nil {
 		la.indexDB.Close()
+		la.indexDB = nil
 	}
+
+	// 关闭索引队列
+	close(la.indexQueue)
+
+	// 关闭完成通知
+	close(la.done)
+
 	return nil
 }
 
